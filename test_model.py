@@ -4,13 +4,14 @@
 #   python predict_one.py "Patrick Mahomes" "BUF" "passing_yards" 275.5
 #   python predict_one.py "Justin Jefferson" "GB" "receptions" 6.5
 #
-# What it does:
-# - Loads model_final.keras + your nfl_player_gamelogs.json
-# - Computes exp-decay "recent form" features from ALL prior games for (player, stat_category)
-# - Predicts the next-game stat value vs the opponent
-# - ALSO prints the player's per-game stat log vs that opponent:
-#     (a) all-time vs that opponent
-#     (b) last 5 games vs that opponent (if available; no "less than 5" message)
+# Notes:
+# - Uses model_final.keras + your nfl_player_gamelogs.json to compute features.
+# - Requires the player_display_name to match exactly (case-sensitive).
+# - Outputs:
+#   1) Model prediction
+#   2) All-time vs opponent: AVERAGES (plus games count)
+#   3) Last 5 vs opponent: per-game pretty JSON blocks (same as before)
+# - If player not found: prints closest matches.
 
 import sys
 import json
@@ -87,7 +88,7 @@ def get_player_id_or_none(df: pl.DataFrame, display_name: str):
 
 
 # ----------------------------
-# Relevant columns to print vs opponent
+# Relevant columns to show vs opponent
 # ----------------------------
 QB_COLS = [
     "passing_yards", "completions", "attempts",
@@ -100,13 +101,10 @@ RB_COLS = ["rushing_yards", "rushing_tds", "receiving_yards", "receptions", "rec
 ID_COLS = ["game_date", "season", "week", "season_type", "team", "opponent_team"]
 
 
-def choose_relevant_cols(df: pl.DataFrame, position_group: str, stat_category: str):
+def choose_relevant_stat_cols(df: pl.DataFrame, position_group: str, stat_category: str) -> list[str]:
     """
-    Choose which stats to print for per-game logs.
-    Preference:
-      - If position_group suggests QB/RB/WR/TE, use that set.
-      - Always include the requested stat_category if present.
-      - Include only columns that exist.
+    Returns stat columns (NOT id columns) relevant to the player's position group.
+    Ensures requested stat_category is included (if present).
     """
     if position_group == "QB":
         cols = QB_COLS[:]
@@ -120,8 +118,37 @@ def choose_relevant_cols(df: pl.DataFrame, position_group: str, stat_category: s
     if stat_category not in cols:
         cols = [stat_category] + cols
 
-    cols = [c for c in cols if c in df.columns]
-    return ID_COLS + cols
+    return [c for c in cols if c in df.columns]
+
+
+def pl_date_to_str(x):
+    try:
+        return x.isoformat()
+    except Exception:
+        return str(x)
+
+
+def df_to_pretty_records(df: pl.DataFrame) -> list[dict]:
+    recs = df.to_dicts()
+    for r in recs:
+        if "game_date" in r and r["game_date"] is not None:
+            r["game_date"] = pl_date_to_str(r["game_date"])
+    return recs
+
+
+def print_last_games_json(title: str, df: pl.DataFrame):
+    recs = df_to_pretty_records(df)
+    print(f"\n{title} (games: {len(recs)})")
+    for i, r in enumerate(recs, 1):
+        print(f"\nGame {i}:")
+        print(json.dumps(r, indent=2))
+
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 
 # ----------------------------
@@ -150,17 +177,18 @@ def predict_next_value(model, df: pl.DataFrame, player_id: str, opponent_team: s
 
 
 # ----------------------------
-# Printing opponent logs
+# Opponent summary + last 5 logs
 # ----------------------------
-def print_vs_opponent_logs(player_games: pl.DataFrame, opponent_team: str, stat_category: str):
-    # Determine position_group for relevant stats selection
-    pos_group = None
-    if "position_group" in player_games.columns and player_games.height > 0:
-        pos_group = player_games.select("position_group")[0, 0]
-    else:
-        pos_group = "UNKNOWN"
+def print_vs_opponent_summary_and_last5(player_games: pl.DataFrame, opponent_team: str, stat_category: str):
+    if player_games.height == 0:
+        print("\nNo games for this player in dataset.")
+        return
 
-    cols_to_show = choose_relevant_cols(player_games, pos_group, stat_category)
+    pos_group = "UNKNOWN"
+    if "position_group" in player_games.columns:
+        pos_group = player_games.select("position_group")[0, 0]
+
+    stat_cols = choose_relevant_stat_cols(player_games, pos_group, stat_category)
 
     vs = (
         player_games
@@ -172,14 +200,30 @@ def print_vs_opponent_logs(player_games: pl.DataFrame, opponent_team: str, stat_
         print(f"\nNo games found vs {opponent_team} in this dataset.")
         return
 
-    vs_all = vs.select([c for c in cols_to_show if c in vs.columns])
-    print(f"\n---- All-time vs {opponent_team} (per-game) ----")
-    # print in a readable multi-line table format
-    print(vs_all)
+    # 1) ALL-TIME AVERAGES
+    # Use mean over all games vs opponent for each relevant stat column.
+    agg_exprs = [pl.col(c).mean().alias(c) for c in stat_cols if c in vs.columns]
+    avg_df = vs.select(agg_exprs) if agg_exprs else pl.DataFrame()
 
-    vs_last5 = vs.tail(5).select([c for c in cols_to_show if c in vs.columns])
-    print(f"\n---- Last 5 vs {opponent_team} ----")
-    print(vs_last5)
+    print(f"\n---- All-time vs {opponent_team} Averages ----")
+    print(f"games: {vs.height}")
+    if avg_df.height > 0:
+        avg_row = avg_df.row(0, named=True)
+        # pretty print key: value with rounding
+        for k in stat_cols:
+            if k in avg_row:
+                v = safe_float(avg_row[k])
+                if v is None:
+                    continue
+                print(f"{k}: {v:.3f}")
+    else:
+        print("(No relevant stat columns available to average.)")
+
+    # 2) LAST 5 PER-GAME (same JSON format as before)
+    cols_for_last5 = [c for c in (ID_COLS + stat_cols) if c in vs.columns]
+    vs_last5 = vs.tail(5).select(cols_for_last5)
+
+    print_last_games_json(f"---- Last 5 vs {opponent_team} ----", vs_last5)
 
 
 # ----------------------------
@@ -203,8 +247,9 @@ def main():
     if player_id is None:
         print(f'Player "{player_name}" not found in dataset.')
         if suggestions is not None and suggestions.height > 0:
-            print("Closest matches:")
-            print(suggestions)
+            print("\nClosest matches:")
+            for name in suggestions["player_display_name"].to_list():
+                print(" -", name)
         return
 
     pred, feats, player_games = predict_next_value(model, df, player_id, opponent, stat_category)
@@ -220,8 +265,8 @@ def main():
         decision = "OVER" if pred > line else "UNDER"
         print("line:", line, "=>", decision, "(pred - line =", pred - line, ")")
 
-    # Print historical logs vs opponent (all-time + last 5)
-    print_vs_opponent_logs(player_games, opponent, stat_category)
+    # All-time averages vs opponent + last 5 games vs opponent in readable JSON
+    print_vs_opponent_summary_and_last5(player_games, opponent, stat_category)
 
 
 if __name__ == "__main__":
