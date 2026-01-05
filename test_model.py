@@ -10,8 +10,15 @@
 # - Outputs:
 #   1) Model prediction
 #   2) All-time vs opponent: AVERAGES (plus games count)
-#   3) Last 5 vs opponent: per-game pretty JSON blocks (same as before)
-# - If player not found: prints closest matches.
+#   3) Last 5 vs opponent: per-game pretty JSON blocks
+#   4) Opponent defense (approx): yards/TDs allowed per game over their last 10 games
+#
+# IMPORTANT:
+# The "opponent allowed" section is computed from your player-game-log dataset by:
+# - filtering all player rows where opponent_team == OPP
+# - grouping into games (by date/season/week/season_type/offense team)
+# - summing offense totals: passing_yards + rushing_yards, passing_tds + rushing_tds
+# This is a good approximation using your available data (no schedules/defense table needed).
 
 import sys
 import json
@@ -177,7 +184,7 @@ def predict_next_value(model, df: pl.DataFrame, player_id: str, opponent_team: s
 
 
 # ----------------------------
-# Opponent summary + last 5 logs
+# Opponent summary + last 5 logs (player vs opponent)
 # ----------------------------
 def print_vs_opponent_summary_and_last5(player_games: pl.DataFrame, opponent_team: str, stat_category: str):
     if player_games.height == 0:
@@ -200,8 +207,7 @@ def print_vs_opponent_summary_and_last5(player_games: pl.DataFrame, opponent_tea
         print(f"\nNo games found vs {opponent_team} in this dataset.")
         return
 
-    # 1) ALL-TIME AVERAGES
-    # Use mean over all games vs opponent for each relevant stat column.
+    # 1) ALL-TIME AVERAGES (player vs opponent)
     agg_exprs = [pl.col(c).mean().alias(c) for c in stat_cols if c in vs.columns]
     avg_df = vs.select(agg_exprs) if agg_exprs else pl.DataFrame()
 
@@ -209,7 +215,6 @@ def print_vs_opponent_summary_and_last5(player_games: pl.DataFrame, opponent_tea
     print(f"games: {vs.height}")
     if avg_df.height > 0:
         avg_row = avg_df.row(0, named=True)
-        # pretty print key: value with rounding
         for k in stat_cols:
             if k in avg_row:
                 v = safe_float(avg_row[k])
@@ -219,11 +224,92 @@ def print_vs_opponent_summary_and_last5(player_games: pl.DataFrame, opponent_tea
     else:
         print("(No relevant stat columns available to average.)")
 
-    # 2) LAST 5 PER-GAME (same JSON format as before)
+    # 2) LAST 5 PER-GAME (player vs opponent)
     cols_for_last5 = [c for c in (ID_COLS + stat_cols) if c in vs.columns]
     vs_last5 = vs.tail(5).select(cols_for_last5)
 
     print_last_games_json(f"---- Last 5 vs {opponent_team} ----", vs_last5)
+
+
+# ----------------------------
+# NEW: Opponent defense allowed (last 10 games)
+# ----------------------------
+def print_opponent_allowed_last10(df_all: pl.DataFrame, opponent_team: str):
+    """
+    Approx opponent defensive allowed per game over last 10 games:
+    - Filter all player rows where opponent_team == opponent_team
+    - Group into games by (game_date, season, week, season_type, offense_team)
+    - Sum offense totals:
+        total_yards = sum(passing_yards) + sum(rushing_yards)
+        total_tds   = sum(passing_tds) + sum(rushing_tds)
+    """
+    required_keys = ["game_date", "season", "week", "season_type", "team", "opponent_team"]
+    for k in required_keys:
+        if k not in df_all.columns:
+            print(f"\n---- {opponent_team} Defense (last 10) ----")
+            print(f"Cannot compute opponent-allowed stats; missing column: {k}")
+            return
+
+    # Make sure these stat columns exist; if not, treat as 0
+    def col_or_zero(name: str):
+        return pl.col(name) if name in df_all.columns else pl.lit(0)
+
+    against_opp = (
+        df_all
+        .filter(pl.col("opponent_team") == opponent_team)
+        .select(required_keys + [c for c in ["passing_yards", "rushing_yards", "passing_tds", "rushing_tds"] if c in df_all.columns])
+    )
+
+    if against_opp.height == 0:
+        print(f"\n---- {opponent_team} Defense (last 10) ----")
+        print("No games found for this opponent in dataset.")
+        return
+
+    # Build per-game totals allowed by this opponent
+    games = (
+        against_opp
+        .group_by(["game_date", "season", "week", "season_type", "team"], maintain_order=True)
+        .agg([
+            col_or_zero("passing_yards").sum().alias("pass_yards_allowed"),
+            col_or_zero("rushing_yards").sum().alias("rush_yards_allowed"),
+            col_or_zero("passing_tds").sum().alias("pass_tds_allowed"),
+            col_or_zero("rushing_tds").sum().alias("rush_tds_allowed"),
+        ])
+        .with_columns([
+            (pl.col("pass_yards_allowed") + pl.col("rush_yards_allowed")).alias("total_yards_allowed"),
+            (pl.col("pass_tds_allowed") + pl.col("rush_tds_allowed")).alias("total_tds_allowed"),
+        ])
+        .sort("game_date")
+    )
+
+    last10 = games.tail(10)
+
+    # Averages over last 10 games
+    avg = last10.select([
+        pl.col("pass_yards_allowed").mean().alias("avg_pass_yards_allowed"),
+        pl.col("rush_yards_allowed").mean().alias("avg_rush_yards_allowed"),
+        pl.col("total_yards_allowed").mean().alias("avg_total_yards_allowed"),
+        pl.col("pass_tds_allowed").mean().alias("avg_pass_tds_allowed"),
+        pl.col("rush_tds_allowed").mean().alias("avg_rush_tds_allowed"),
+        pl.col("total_tds_allowed").mean().alias("avg_total_tds_allowed"),
+    ]).row(0, named=True)
+
+    print(f"\n---- {opponent_team} Defense: Allowed per game (last 10 games) ----")
+    print(f"games: {last10.height}")
+    print(f"pass_yards_allowed: {float(avg['avg_pass_yards_allowed']):.3f}")
+    print(f"rush_yards_allowed: {float(avg['avg_rush_yards_allowed']):.3f}")
+    print(f"total_yards_allowed: {float(avg['avg_total_yards_allowed']):.3f}")
+    print(f"pass_tds_allowed: {float(avg['avg_pass_tds_allowed']):.3f}")
+    print(f"rush_tds_allowed: {float(avg['avg_rush_tds_allowed']):.3f}")
+    print(f"total_tds_allowed: {float(avg['avg_total_tds_allowed']):.3f}")
+
+    # Optional: show the actual last 10 game totals (readable, not too wide)
+    last10_show = last10.select([
+        "game_date", "season", "week", "season_type", "team",
+        "pass_yards_allowed", "rush_yards_allowed", "total_yards_allowed",
+        "pass_tds_allowed", "rush_tds_allowed", "total_tds_allowed",
+    ])
+    print_last_games_json(f"---- {opponent_team} Defense: Last 10 game totals ----", last10_show)
 
 
 # ----------------------------
@@ -265,8 +351,11 @@ def main():
         decision = "OVER" if pred > line else "UNDER"
         print("line:", line, "=>", decision, "(pred - line =", pred - line, ")")
 
-    # All-time averages vs opponent + last 5 games vs opponent in readable JSON
+    # Player vs opponent: all-time averages + last 5 games
     print_vs_opponent_summary_and_last5(player_games, opponent, stat_category)
+
+    # Opponent defense: last 10 games allowed per game (approx, from your dataset)
+    print_opponent_allowed_last10(df, opponent)
 
 
 if __name__ == "__main__":
