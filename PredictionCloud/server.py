@@ -418,3 +418,12 @@ def predict(req: PredictRequest):
         opp_def_last10_averages=opp_avg,
         opp_def_last10_games=opp_last10,
     )
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "NFL Props Predictor API is running. Use /docs for Swagger UI."}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
