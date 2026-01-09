@@ -1,6 +1,7 @@
 # server.py
 #
-# FastAPI backend for Swift frontend.
+# FastAPI backend for props prediction.
+# Memory-safe version for Render: uses Parquet + Polars lazy queries (no full dataset in RAM).
 #
 # POST /predict
 # Body:
@@ -20,17 +21,26 @@
 
 from __future__ import annotations
 
-import json
-from typing import Optional, List, Dict
+import os
+from typing import Optional, List, Dict, Tuple, Any
+
 import numpy as np
 import polars as pl
 import tensorflow as tf
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-MODEL_PATH = "model_final.keras"
-JSON_PATH  = "nfl_player_gamelogs.json"
+
+# ----------------------------
+# Config
+# ----------------------------
+MODEL_PATH   = "model_final.keras"
+PARQUET_PATH = "nfl_player_gamelogs.parquet"
 TAU = 18.0
+
+# Reduce noisy TF logs (optional)
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 # stat columns present in your dataset
 CATEGORIES = [
@@ -87,20 +97,63 @@ class PredictResponse(BaseModel):
     edge: Optional[float] = None
 
     player_vs_opp_all_time: PlayerVsOpponentAllTime
-    player_vs_opp_last5: List[Dict[str, object]]
+    player_vs_opp_last5: List[Dict[str, Any]]
 
     opp_def_last10_averages: Optional[OppDefenseLast10Averages] = None
-    opp_def_last10_games: List[Dict[str, object]]
+    opp_def_last10_games: List[Dict[str, Any]]
 
 
 app = FastAPI(title="NFL Props Predictor API")
 
 model: tf.keras.Model | None = None
-df_all: pl.DataFrame | None = None
+
+# Small lookup table cached in RAM: display_name -> player_id
+# This is tiny compared to the full dataset and avoids scanning the whole file for every request.
+player_lookup: pl.DataFrame | None = None
 
 
 # ----------------------------
-# Helpers
+# Polars helpers
+# ----------------------------
+def scan_data() -> pl.LazyFrame:
+    """
+    Lazy scan of the Parquet. Does NOT load the dataset into RAM.
+    Ensures game_date is a Date column.
+    """
+    lf = pl.scan_parquet(PARQUET_PATH)
+
+    # Some Parquet exports store game_date as Utf8; some as Date already.
+    # We normalize safely:
+    # - If it's Utf8, parse
+    # - If it's Date/Datetime, cast to Date
+    #
+    # Polars doesn't have a simple "if dtype is ..." inside lazy easily,
+    # so we do a robust approach:
+    # - try parse as Date if Utf8; if it's already Date, the cast works fine.
+    lf = lf.with_columns(
+        pl.col("game_date")
+        .cast(pl.Utf8, strict=False)
+        .str.strptime(pl.Date, "%Y-%m-%d", strict=False)
+        .fill_null(pl.col("game_date").cast(pl.Date, strict=False))
+        .alias("game_date")
+    )
+    return lf
+
+
+def to_records(df: pl.DataFrame) -> List[Dict[str, Any]]:
+    recs = df.to_dicts()
+    for r in recs:
+        if "game_date" in r and r["game_date"] is not None:
+            r["game_date"] = str(r["game_date"])
+    return recs
+
+
+def col_or_zero(name: str, available_cols: set[str]):
+    return pl.col(name) if name in available_cols else pl.lit(0)
+
+
+# ----------------------------
+# Decay feature helpers (must match training)
 # ----------------------------
 def exp_weights_all(n: int, tau: float) -> np.ndarray:
     idx = np.arange(n, dtype=np.float32)
@@ -138,69 +191,88 @@ def choose_relevant_stat_cols(position_group: str, stat_category: str, available
     if stat_category not in cols:
         cols = [stat_category] + cols
 
-    # only keep those that exist in df
     return [c for c in cols if c in available_cols]
 
 
-def to_records(df: pl.DataFrame) -> List[Dict[str, object]]:
-    recs = df.to_dicts()
-    # make dates JSON-safe
-    for r in recs:
-        if "game_date" in r and r["game_date"] is not None:
-            r["game_date"] = str(r["game_date"])
-    return recs
-
-
-def get_player_id_or_none(df: pl.DataFrame, display_name: str) -> Optional[str]:
-    m = df.filter(pl.col("player_display_name") == display_name).select("player_id").unique()
-    if m.height == 0:
-        return None
-    return m[0, 0]
-
-
-def get_suggestions(df: pl.DataFrame, query: str) -> List[str]:
-    s = (
-        df.select("player_display_name")
-          .unique()
-          .filter(pl.col("player_display_name").str.contains(query, literal=False))
-          .head(10)
-    )
-    return s["player_display_name"].to_list() if s.height > 0 else []
-
-
-def col_or_zero(name: str, available_cols: set[str]):
-    return pl.col(name) if name in available_cols else pl.lit(0)
-
-
 # ----------------------------
-# Startup (load once)
+# Startup: load model + small player lookup
 # ----------------------------
 @app.on_event("startup")
 def startup():
-    global model, df_all
+    global model, player_lookup
+
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError(f"Missing model file: {MODEL_PATH}")
+    if not os.path.exists(PARQUET_PATH):
+        raise RuntimeError(f"Missing data file: {PARQUET_PATH}. Convert JSON -> Parquet first.")
+
     model = tf.keras.models.load_model(MODEL_PATH)
 
-    with open(JSON_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    df_all = pl.DataFrame(data)
-
-    df_all = (
-        df_all.with_columns(
-            pl.col("game_date").str.strptime(pl.Date, "%Y-%m-%d", strict=False).alias("game_date")
-        )
-        .sort(["player_id", "game_date"])
+    # Build a tiny lookup table once:
+    # display_name -> player_id (and optionally position_group)
+    player_lookup = (
+        scan_data()
+        .select(["player_display_name", "player_id", "position_group"])
+        .unique()
+        .collect()
     )
 
 
 # ----------------------------
-# Core computations
+# Player lookup + suggestions
 # ----------------------------
-def predict_value(player_id: str, opponent: str, stat_category: str):
-    assert df_all is not None and model is not None
+def get_player_id_or_404(display_name: str) -> str:
+    assert player_lookup is not None
 
-    player_games = df_all.filter(pl.col("player_id") == player_id).sort("game_date")
+    m = player_lookup.filter(pl.col("player_display_name") == display_name).select("player_id")
+    if m.height == 0:
+        # suggestions (contains)
+        sugg = (
+            player_lookup
+            .select("player_display_name")
+            .unique()
+            .filter(pl.col("player_display_name").str.contains(display_name, literal=False))
+            .head(10)
+        )
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f'Player "{display_name}" not found.',
+                "suggestions": sugg["player_display_name"].to_list() if sugg.height > 0 else [],
+            },
+        )
+    return m[0, 0]
+
+
+# ----------------------------
+# Core computations (Parquet-backed)
+# ----------------------------
+def get_player_games(player_id: str, cols: List[str]) -> pl.DataFrame:
+    """
+    Returns all games for one player, sorted by game_date, only for specified cols.
+    """
+    lf = scan_data().filter(pl.col("player_id") == player_id).select(cols).sort("game_date")
+    return lf.collect()
+
+
+def predict_value(player_id: str, opponent: str, stat_category: str) -> Tuple[float, List[float], pl.DataFrame]:
+    assert model is not None
+
+    # Pull only what we need for prediction + downstream summaries
+    needed_cols = list(set([
+        "player_id", "player_display_name", "position_group",
+        "opponent_team", "team", "season", "week", "season_type", "game_date",
+        stat_category,
+        *QB_COLS, *RB_COLS, *WRTE_COLS  # so summaries have what they need
+    ]))
+
+    player_games = get_player_games(player_id, needed_cols)
+
     if player_games.height < 2:
         raise HTTPException(status_code=400, detail="Not enough history for this player.")
+
+    if stat_category not in player_games.columns:
+        raise HTTPException(status_code=400, detail=f"Unknown stat_category '{stat_category}'")
 
     hist_vals = player_games.select(stat_category).to_numpy().reshape(-1).astype(np.float32)
     feats = build_features_from_history(hist_vals, TAU)
@@ -211,6 +283,7 @@ def predict_value(player_id: str, opponent: str, stat_category: str):
         "stat_category": tf.convert_to_tensor([stat_category], dtype=tf.string),
         "num_feats": tf.convert_to_tensor([feats], dtype=tf.float32),
     }
+
     pred = float(model.predict(inputs, verbose=0).reshape(-1)[0])
     return pred, feats.tolist(), player_games
 
@@ -245,40 +318,40 @@ def player_vs_opponent_stats(player_games: pl.DataFrame, opponent: str, stat_cat
 def opponent_def_allowed_last10(opponent: str):
     """
     Approx defensive allowed per game for opponent over their last 10 games.
-    Uses your dataset:
-      - filter rows with opponent_team == opponent
-      - group into games by (game_date, season, week, season_type, offense team)
-      - sum offense totals: pass/rush yards + pass/rush TDs
+    Uses Parquet + lazy query (does NOT load all rows).
     """
-    assert df_all is not None
-    available = set(df_all.columns)
+    lf = scan_data()
+    available_cols = set(lf.columns)
 
     required = ["game_date", "season", "week", "season_type", "team", "opponent_team"]
-    for k in required:
-        if k not in available:
-            return None, []
-
-    against = df_all.filter(pl.col("opponent_team") == opponent)
-    if against.height == 0:
+    if any(c not in available_cols for c in required):
         return None, []
+
+    against = lf.filter(pl.col("opponent_team") == opponent)
+    # If no rows, return None
+    # (Polars lazy can't easily "if empty" without collect; we handle later)
 
     games = (
         against
         .group_by(["game_date", "season", "week", "season_type", "team"], maintain_order=True)
         .agg([
-            col_or_zero("passing_yards", available).sum().alias("pass_yards_allowed"),
-            col_or_zero("rushing_yards", available).sum().alias("rush_yards_allowed"),
-            col_or_zero("passing_tds", available).sum().alias("pass_tds_allowed"),
-            col_or_zero("rushing_tds", available).sum().alias("rush_tds_allowed"),
+            col_or_zero("passing_yards", available_cols).sum().alias("pass_yards_allowed"),
+            col_or_zero("rushing_yards", available_cols).sum().alias("rush_yards_allowed"),
+            col_or_zero("passing_tds", available_cols).sum().alias("pass_tds_allowed"),
+            col_or_zero("rushing_tds", available_cols).sum().alias("rush_tds_allowed"),
         ])
         .with_columns([
             (pl.col("pass_yards_allowed") + pl.col("rush_yards_allowed")).alias("total_yards_allowed"),
             (pl.col("pass_tds_allowed") + pl.col("rush_tds_allowed")).alias("total_tds_allowed"),
         ])
         .sort("game_date")
+        .tail(10)
     )
 
-    last10 = games.tail(10)
+    last10 = games.collect()
+    if last10.height == 0:
+        return None, []
+
     avg = last10.select([
         pl.col("pass_yards_allowed").mean().alias("pass_yards_allowed"),
         pl.col("rush_yards_allowed").mean().alias("rush_yards_allowed"),
@@ -314,18 +387,10 @@ def opponent_def_allowed_last10(opponent: str):
 # ----------------------------
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
-    assert df_all is not None
-
     if req.stat_category not in set(CATEGORIES):
         raise HTTPException(status_code=400, detail=f"Unknown stat_category '{req.stat_category}'")
 
-    player_id = get_player_id_or_none(df_all, req.player_name)
-    if player_id is None:
-        suggestions = get_suggestions(df_all, req.player_name)
-        raise HTTPException(
-            status_code=404,
-            detail={"message": f'Player "{req.player_name}" not found.', "suggestions": suggestions},
-        )
+    player_id = get_player_id_or_404(req.player_name)
 
     pred, feats, player_games = predict_value(player_id, req.opponent, req.stat_category)
 

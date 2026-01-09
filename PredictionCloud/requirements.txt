@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-tensorflow
-polars
+pydantic
 numpy
+polars
+tensorflow
